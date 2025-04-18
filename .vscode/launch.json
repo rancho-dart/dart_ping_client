@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: dt_ping",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/dt_ping.py",
+            "args": ["c2.sh.cn", "-i", "1", "-t", "2"],
+            "console": "integratedTerminal"
+        }
+    ]
+}
