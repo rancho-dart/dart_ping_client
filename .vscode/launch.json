@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: dt_ping",
-            "type": "python",
+            "name": "Go: Launch dt_ping",
+            "type": "go",
             "request": "launch",
-            "program": "${workspaceFolder}/dt_ping.py",
+            "program": "${workspaceFolder}/dt_ping.go",
             "args": ["c2.sh.cn", "-i", "1", "-t", "2"],
             "console": "integratedTerminal"
         }
