@@ -187,9 +187,10 @@ def signal_handler(sig, frame):
     print(f"{pinger.sent_count} packets transmitted, {pinger.recv_count} received, "
           f"{loss:.1f}% packet loss")
     if pinger.rtt_list:
-        print(f"rtt min/avg/max = {min(filter(None, pinger.rtt_list)):.2f}/"
-              f"{sum(filter(None, pinger.rtt_list))/len(filter(None, pinger.rtt_list)):.2f}/"
-              f"{max(filter(None, pinger.rtt_list)):.2f} ms")
+        rtt_values = list(filter(None, pinger.rtt_list))
+        print(f"rtt min/avg/max = {min(rtt_values):.2f}/"
+              f"{sum(rtt_values)/len(rtt_values):.2f}/"
+              f"{max(rtt_values):.2f} ms")
     sys.exit(0)
 
 import subprocess

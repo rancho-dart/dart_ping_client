@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -49,6 +50,9 @@ type DARTPinger struct {
 	SentCount  int
 	RecvCount  int
 	RTTs       []time.Duration
+	PacketSize int
+	Count      int
+	Flood      bool
 }
 
 func (h *DARTHeader) Pack() []byte {
@@ -60,6 +64,10 @@ func (h *DARTHeader) Pack() []byte {
 	buf.Write(h.DstFQDN)
 	buf.Write(h.SrcFQDN)
 	return buf.Bytes()
+}
+
+func (h *DARTHeader) size() int {
+	return 4 + len(h.DstFQDN) + len(h.SrcFQDN)
 }
 
 func (p *ICMPPacket) CalculateChecksum() uint16 {
@@ -120,16 +128,16 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 		SrcFQDN:       []byte(p.SrcFQDN),
 	}
 
-	icmpPacket := NewICMPPacket(seq, 32)
+	icmpPacket := NewICMPPacket(seq, p.PacketSize-dartHeader.size()-8) // ICMP报头8字节 + DART报头大小
 	packet := append(dartHeader.Pack(), icmpPacket.Pack()...)
 
-	conn, err := net.Dial(fmt.Sprintf("ip4:%d", DART_PROTOCOL), p.TargetFQDN)
+	conn, err := net.Dial(fmt.Sprintf("ip4:%d", DART_PROTOCOL), p.TargetFQDN) //
 	if err != nil {
 		return time.Time{}, err
 	}
 	defer conn.Close()
 
-	rawConn, err := conn.(*net.IPConn).SyscallConn()
+	rawConn, err := conn.(*net.IPConn).SyscallConn() // 获取原始连接
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -148,26 +156,26 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 	return start, nil
 }
 
-func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Duration, error) {
+func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Duration, int, error) {
 	conn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", DART_PROTOCOL), "0.0.0.0")
 	if err != nil {
-		return false, 0, err
+		return false, 0, 0, err
 	}
 	defer conn.Close()
 
 	err = conn.SetDeadline(time.Now().Add(p.Timeout))
 	if err != nil {
-		return false, 0, err
+		return false, 0, 0, err
 	}
 
-	recvBuf := make([]byte, 1024)
+	recvBuf := make([]byte, 4096)
 	for {
-		n, _, err := conn.ReadFrom(recvBuf)
+		pktSize, _, err := conn.ReadFrom(recvBuf) // pktSize只包含从DART报头开始的字节数
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				return false, 0, nil // Timeout
+				return false, 0, 0, nil // Timeout
 			}
-			return false, 0, err
+			return false, 0, 0, err
 		}
 
 		dartStart := 0
@@ -177,7 +185,7 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 
 		// 解析ICMP响应
 		icmpStart := int(dartStart) + 4 + int(recvBuf[dartStart+2]) + int(recvBuf[dartStart+3])
-		if n < icmpStart+8 {
+		if pktSize < icmpStart+8 {
 			continue
 		}
 
@@ -188,7 +196,7 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 				rtt := time.Since(sentTime)
 				p.RTTs = append(p.RTTs, rtt)
 				p.RecvCount++
-				return true, rtt, nil
+				return true, rtt, pktSize, nil
 			}
 		}
 	}
@@ -247,12 +255,21 @@ func getFQDN() string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: sudo ./dart_ping <target>")
+	var packetSize int
+	var count int
+	var flood bool
+
+	flag.IntVar(&packetSize, "s", 64, "Specify the packet size")
+	flag.IntVar(&count, "c", -1, "Specify the number of packets to send")
+	flag.BoolVar(&flood, "f", false, "Enable flood ping mode")
+	flag.Parse()
+
+	if len(flag.Args()) < 1 {
+		fmt.Println("Usage: sudo ./dart_ping [-s packet_size] [-c count] [-f] <target>")
 		os.Exit(1)
 	}
 
-	target := os.Args[1]
+	target := flag.Args()[0]
 	srcFQDN := getFQDN()
 
 	pinger := &DARTPinger{
@@ -260,6 +277,9 @@ func main() {
 		SrcFQDN:    srcFQDN,
 		TTL:        64,
 		Timeout:    2 * time.Second,
+		PacketSize: packetSize,
+		Count:      count,
+		Flood:      flood,
 	}
 
 	// 处理Ctrl+C
@@ -275,31 +295,39 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("PING %s (%s) via DART protocol\n", target, ipAddr)
+	fmt.Printf("PING %s (%s - if not in same domain, this ip is actually the gateway :-)) via DART protocol\n", target, ipAddr)
 
 	seq := uint16(0)
 	for {
+		if pinger.Count > 0 && pinger.SentCount >= pinger.Count {
+			break
+		}
+
 		start, err := pinger.SendPacket(seq)
 		if err != nil {
 			log.Printf("Send error: %v", err)
 			continue
 		}
 
-		success, rtt, err := pinger.RecvResponse(seq, start)
+		success, rtt, n, err := pinger.RecvResponse(seq, start)
 		if err != nil {
 			log.Printf("Receive error: %v", err)
 		}
 
 		if success {
 			fmt.Printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.2f ms\n",
-				len(ipAddr.String())+8+32, pinger.TargetFQDN, seq, pinger.TTL, float64(rtt.Microseconds())/1000)
+				n, pinger.TargetFQDN, seq, pinger.TTL, float64(rtt.Microseconds())/1000)
 		} else {
 			fmt.Printf("Request timeout for icmp_seq %d\n", seq)
 		}
 
 		seq++
-		time.Sleep(1 * time.Second)
+		if !pinger.Flood {
+			time.Sleep(1 * time.Second)
+		}
 	}
+
+	pinger.PrintStats()
 }
 
 func (p *DARTPinger) PrintStats() {
