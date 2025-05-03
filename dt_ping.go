@@ -53,7 +53,7 @@ type DARTPinger struct {
 	PacketSize int
 	Count      int
 	Flood      bool
-	conn       *net.UDPConn // 新增：将conn定义到DARTPinger中
+	udpConn    *net.UDPConn // 新增：将conn定义到DARTPinger中
 }
 
 func (h *DARTHeader) Pack() []byte {
@@ -131,12 +131,12 @@ func (p *DARTPinger) InitConn() error {
 		return err
 	}
 
-	conn, err := net.DialUDP("udp4", localAddr, addr)
+	udpConn, err := net.DialUDP("udp4", localAddr, addr)
 	if err != nil {
 		return err
 	}
 
-	rawConn, err := conn.SyscallConn()
+	rawConn, err := udpConn.SyscallConn()
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (p *DARTPinger) InitConn() error {
 		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, p.TTL)
 	})
 
-	p.conn = conn
+	p.udpConn = udpConn
 	return nil
 }
 
@@ -163,24 +163,30 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 	packet := append(dartHeader.Pack(), icmpPacket.Pack()...)
 
 	start := time.Now()
-	_, err := p.conn.Write(packet) // 修改: 使用p.conn发送数据包
+	_, err := p.udpConn.Write(packet) // 修改: 使用p.conn发送数据包
 	if err != nil {
 		return time.Time{}, err
 	}
 
 	p.SentCount++
+
+	// 新增：Flood模式下显示点
+	if p.Flood {
+		fmt.Print(".")
+	}
+
 	return start, nil
 }
 
 func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Duration, int, error) {
 	recvBuf := make([]byte, 4096)
-	err := p.conn.SetDeadline(time.Now().Add(p.Timeout)) // 修改: 使用p.conn设置超时
+	err := p.udpConn.SetDeadline(time.Now().Add(p.Timeout)) // 修改: 使用p.conn设置超时
 	if err != nil {
 		return false, 0, 0, err
 	}
 
 	for {
-		n, _, err := p.conn.ReadFromUDP(recvBuf) // 修改: 使用p.conn接收数据包
+		n, _, err := p.udpConn.ReadFromUDP(recvBuf) // 修改: 使用p.conn接收数据包
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 				return false, 0, 0, nil // Timeout
@@ -209,6 +215,12 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 				rtt := time.Since(sentTime)
 				p.RTTs = append(p.RTTs, rtt)
 				p.RecvCount++
+
+				// 新增：Flood模式下删除点
+				if p.Flood {
+					fmt.Print("\b \b") // 删除点
+				}
+
 				return true, rtt, n, nil
 			}
 		}
@@ -300,7 +312,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize connection: %v", err)
 	}
-	defer pinger.conn.Close()
+	defer pinger.udpConn.Close()
 
 	// 处理Ctrl+C
 	sigCh := make(chan os.Signal, 1)
@@ -319,10 +331,6 @@ func main() {
 
 	seq := uint16(0)
 	for {
-		if pinger.Count > 0 && pinger.SentCount >= pinger.Count {
-			break
-		}
-
 		start, err := pinger.SendPacket(seq)
 		if err != nil {
 			log.Printf("Send error: %v", err)
@@ -334,14 +342,21 @@ func main() {
 			log.Printf("Receive error: %v", err)
 		}
 
-		if success {
-			fmt.Printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.2f ms\n",
-				n, pinger.TargetFQDN, seq, pinger.TTL, float64(rtt.Microseconds())/1000)
-		} else {
-			fmt.Printf("Request timeout for icmp_seq %d\n", seq)
+		if !pinger.Flood {
+			if success {
+				fmt.Printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.2f ms\n",
+					n, pinger.TargetFQDN, seq, pinger.TTL, float64(rtt.Microseconds())/1000)
+			} else {
+				fmt.Printf("Request timeout for icmp_seq %d\n", seq)
+			}
+		}
+
+		if pinger.Count > 0 && pinger.SentCount >= pinger.Count {
+			break
 		}
 
 		seq++
+
 		if !pinger.Flood {
 			time.Sleep(1 * time.Second)
 		}
