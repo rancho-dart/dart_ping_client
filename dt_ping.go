@@ -53,6 +53,7 @@ type DARTPinger struct {
 	PacketSize int
 	Count      int
 	Flood      bool
+	conn       *net.UDPConn // 新增：将conn定义到DARTPinger中
 }
 
 func (h *DARTHeader) Pack() []byte {
@@ -118,6 +119,36 @@ func NewICMPPacket(seq uint16, payloadSize int) *ICMPPacket {
 	return p
 }
 
+func (p *DARTPinger) InitConn() error {
+	// 修改: 在InitConn方法中初始化conn
+	localAddr, err := net.ResolveUDPAddr("udp4", ":0") // 自动分配端口
+	if err != nil {
+		return err
+	}
+
+	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", p.TargetFQDN, DART_UDP_PORT))
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialUDP("udp4", localAddr, addr)
+	if err != nil {
+		return err
+	}
+
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	rawConn.Control(func(fd uintptr) {
+		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, p.TTL)
+	})
+
+	p.conn = conn
+	return nil
+}
+
 func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 	dartHeader := &DARTHeader{
 		Version:       1,
@@ -128,35 +159,11 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 		SrcFQDN:       []byte(p.SrcFQDN),
 	}
 
-	icmpPacket := NewICMPPacket(seq, p.PacketSize-dartHeader.size()-8) // ICMP报头8字节 + DART报头大小
+	icmpPacket := NewICMPPacket(seq, p.PacketSize-dartHeader.size()-8)
 	packet := append(dartHeader.Pack(), icmpPacket.Pack()...)
 
-	// 新增：添加UDP报头
-	udpHeader := &UDPPacket{
-		SourcePort: DART_UDP_PORT,
-		DestPort:   DART_UDP_PORT,
-		Length:     uint16(len(packet) + 8), // UDP报头8字节
-	}
-	udpPacket := udpHeader.Pack()
-	packet = append(udpPacket, packet...)
-
-	conn, err := net.Dial(fmt.Sprintf("ip4:%d", syscall.IPPROTO_UDP), p.TargetFQDN)
-	if err != nil {
-		return time.Time{}, err
-	}
-	defer conn.Close()
-
-	rawConn, err := conn.(*net.IPConn).SyscallConn() // 获取原始连接
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	rawConn.Control(func(fd uintptr) {
-		syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, p.TTL)
-	})
-
 	start := time.Now()
-	_, err = conn.Write(packet)
+	_, err := p.conn.Write(packet) // 修改: 使用p.conn发送数据包
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -166,20 +173,14 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 }
 
 func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Duration, int, error) {
-	conn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", syscall.IPPROTO_UDP), "0.0.0.0")
-	if err != nil {
-		return false, 0, 0, err
-	}
-	defer conn.Close()
-
-	err = conn.SetDeadline(time.Now().Add(p.Timeout))
-	if err != nil {
-		return false, 0, 0, err
-	}
-
 	recvBuf := make([]byte, 4096)
+	err := p.conn.SetDeadline(time.Now().Add(p.Timeout)) // 修改: 使用p.conn设置超时
+	if err != nil {
+		return false, 0, 0, err
+	}
+
 	for {
-		pktSize, _, err := conn.ReadFrom(recvBuf) // pktSize只包含从DART报头开始的字节数
+		n, _, err := p.conn.ReadFromUDP(recvBuf) // 修改: 使用p.conn接收数据包
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 				return false, 0, 0, nil // Timeout
@@ -187,28 +188,17 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 			return false, 0, 0, err
 		}
 
-		// 新增：解析UDP报头
-		if pktSize < 8 {
+		// 解析DART报头
+		if n < 4 {
 			continue
 		}
-		udpHeader := &UDPPacket{
-			SourcePort: binary.BigEndian.Uint16(recvBuf[0:2]),
-			DestPort:   binary.BigEndian.Uint16(recvBuf[2:4]),
-			Length:     binary.BigEndian.Uint16(recvBuf[4:6]),
-			Checksum:   binary.BigEndian.Uint16(recvBuf[6:8]),
-		}
-		if udpHeader.SourcePort != DART_UDP_PORT || udpHeader.DestPort != DART_UDP_PORT {
-			continue
-		}
-
-		dartStart := 8 // 跳过UDP报头
-		if recvBuf[dartStart] != 1 || recvBuf[dartStart+1] != ICMP_PROTOCOL {
+		if recvBuf[0] != 1 || recvBuf[1] != ICMP_PROTOCOL {
 			continue // 版本或协议不匹配
 		}
 
 		// 解析ICMP响应
-		icmpStart := int(dartStart) + 4 + int(recvBuf[dartStart+2]) + int(recvBuf[dartStart+3])
-		if pktSize < icmpStart+8 {
+		icmpStart := 4 + int(recvBuf[2]) + int(recvBuf[3])
+		if n < icmpStart+8 {
 			continue
 		}
 
@@ -219,27 +209,10 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 				rtt := time.Since(sentTime)
 				p.RTTs = append(p.RTTs, rtt)
 				p.RecvCount++
-				return true, rtt, pktSize, nil
+				return true, rtt, n, nil
 			}
 		}
 	}
-}
-
-// 新增：UDP报头结构体
-type UDPPacket struct {
-	SourcePort uint16
-	DestPort   uint16
-	Length     uint16
-	Checksum   uint16
-}
-
-func (u *UDPPacket) Pack() []byte {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, u.SourcePort)
-	binary.Write(buf, binary.BigEndian, u.DestPort)
-	binary.Write(buf, binary.BigEndian, u.Length)
-	binary.Write(buf, binary.BigEndian, u.Checksum)
-	return buf.Bytes()
 }
 
 func getFQDN() string {
@@ -322,6 +295,13 @@ func main() {
 		Flood:      flood,
 	}
 
+	// 初始化连接
+	err := pinger.InitConn()
+	if err != nil {
+		log.Fatalf("Failed to initialize connection: %v", err)
+	}
+	defer pinger.conn.Close()
+
 	// 处理Ctrl+C
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT)
@@ -335,7 +315,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("PING %s (%s - if not in same domain, this ip is actually the gateway :-)) via DART protocol\n", target, ipAddr)
+	fmt.Printf("PING %s (%s - may be the gateway if not in same domain) via DART protocol\n", target, ipAddr)
 
 	seq := uint16(0)
 	for {

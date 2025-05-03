@@ -6,7 +6,7 @@
             "type": "go",
             "request": "launch",
             "program": "${workspaceFolder}/dt_ping.go",
-            "args": ["c1.bj.cn", "-i", "1", "-t", "2"],
+            "args": ["c2.sh.cn", "-i", "1", "-t", "2"],
             "console": "integratedTerminal",
             "preLaunchTask": "build dt_ping"
         }
