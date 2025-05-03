@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	DART_PROTOCOL = 254
 	ICMP_PROTOCOL = 1
 	ICMP_ECHO     = 8
 	ICMP_REPLY    = 0
+	DART_UDP_PORT = 0xDA27 // 新增：DART协议使用的UDP端口
 )
 
 type DARTHeader struct {
@@ -131,7 +131,16 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 	icmpPacket := NewICMPPacket(seq, p.PacketSize-dartHeader.size()-8) // ICMP报头8字节 + DART报头大小
 	packet := append(dartHeader.Pack(), icmpPacket.Pack()...)
 
-	conn, err := net.Dial(fmt.Sprintf("ip4:%d", DART_PROTOCOL), p.TargetFQDN) //
+	// 新增：添加UDP报头
+	udpHeader := &UDPPacket{
+		SourcePort: DART_UDP_PORT,
+		DestPort:   DART_UDP_PORT,
+		Length:     uint16(len(packet) + 8), // UDP报头8字节
+	}
+	udpPacket := udpHeader.Pack()
+	packet = append(udpPacket, packet...)
+
+	conn, err := net.Dial(fmt.Sprintf("ip4:%d", syscall.IPPROTO_UDP), p.TargetFQDN)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -157,7 +166,7 @@ func (p *DARTPinger) SendPacket(seq uint16) (time.Time, error) {
 }
 
 func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Duration, int, error) {
-	conn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", DART_PROTOCOL), "0.0.0.0")
+	conn, err := net.ListenPacket(fmt.Sprintf("ip4:%d", syscall.IPPROTO_UDP), "0.0.0.0")
 	if err != nil {
 		return false, 0, 0, err
 	}
@@ -178,7 +187,21 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 			return false, 0, 0, err
 		}
 
-		dartStart := 0
+		// 新增：解析UDP报头
+		if pktSize < 8 {
+			continue
+		}
+		udpHeader := &UDPPacket{
+			SourcePort: binary.BigEndian.Uint16(recvBuf[0:2]),
+			DestPort:   binary.BigEndian.Uint16(recvBuf[2:4]),
+			Length:     binary.BigEndian.Uint16(recvBuf[4:6]),
+			Checksum:   binary.BigEndian.Uint16(recvBuf[6:8]),
+		}
+		if udpHeader.SourcePort != DART_UDP_PORT || udpHeader.DestPort != DART_UDP_PORT {
+			continue
+		}
+
+		dartStart := 8 // 跳过UDP报头
 		if recvBuf[dartStart] != 1 || recvBuf[dartStart+1] != ICMP_PROTOCOL {
 			continue // 版本或协议不匹配
 		}
@@ -200,6 +223,23 @@ func (p *DARTPinger) RecvResponse(seq uint16, start time.Time) (bool, time.Durat
 			}
 		}
 	}
+}
+
+// 新增：UDP报头结构体
+type UDPPacket struct {
+	SourcePort uint16
+	DestPort   uint16
+	Length     uint16
+	Checksum   uint16
+}
+
+func (u *UDPPacket) Pack() []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, u.SourcePort)
+	binary.Write(buf, binary.BigEndian, u.DestPort)
+	binary.Write(buf, binary.BigEndian, u.Length)
+	binary.Write(buf, binary.BigEndian, u.Checksum)
+	return buf.Bytes()
 }
 
 func getFQDN() string {
